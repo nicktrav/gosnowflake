@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -135,21 +134,16 @@ func getIdpURLProofKey(
 // Accept-Encoding: gzip, deflate, br
 // Accept-Language: en-US,en;q=0.9
 // This extracts the token portion of the response.
-func getTokenFromResponse(response string) (string, error) {
+func getTokenFromResponse(response string) string {
 	start := "GET /?token="
 	arr := strings.Split(response, "\r\n")
 	if !strings.HasPrefix(arr[0], start) {
 		glog.V(1).Infof("response is malformed. resp: %s", arr[0])
-		return "", &SnowflakeError{
-			Number:      ErrFailedToParseResponse,
-			SQLState:    SQLStateConnectionRejected,
-			Message:     errMsgFailedToParseResponse,
-			MessageArgs: []interface{}{response},
-		}
+		return ""
 	}
 	token := strings.TrimLeft(arr[0], start)
 	token = strings.Split(token, " ")[0]
-	return token, nil
+	return token
 }
 
 // Authentication by an external browser takes place via the following:
@@ -186,67 +180,89 @@ func authenticateByExternalBrowser(
 		return nil, nil, err
 	}
 
-	var encodedSamlResponse string
-	var acceptErr error
-	var tokenErr error
-	acceptErr = nil
-	for {
-		conn, err := l.Accept()
-		if err != nil {
-			glog.V(1).Infof("unable to accept connection. err: %v", err)
-			log.Fatal(err)
+	// listen for incoming connections, passing each into the channel of
+	// connections to be handled
+	connections := make(chan net.Conn)
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				close(connections)
+				return
+			}
+			connections <- conn
 		}
-		go func(c net.Conn) {
-			var buf bytes.Buffer
-			total := 0
-			for {
-				b := make([]byte, bufSize)
-				n, err := c.Read(b)
-				if err != nil {
-					if err != io.EOF {
-						glog.V(1).Infof("error reading from socket. err: %v", err)
-						acceptErr = err
-					}
-					break
-				}
-				total += n
-				buf.Write(b)
-				if n < bufSize {
-					// We successfully read all data
-					s := string(buf.Bytes()[:total])
-					encodedSamlResponse, tokenErr = getTokenFromResponse(s)
-					break
-				}
-				buf.Grow(bufSize)
-			}
-			if encodedSamlResponse != "" {
-				httpResponse := buildResponse(application)
-				c.Write(httpResponse.Bytes())
-			}
-			c.Close()
-		}(conn)
-		if acceptErr != nil || encodedSamlResponse != "" {
+	}()
+
+	// handle the incoming connections until either a valid response is
+	// returned, or an irrecoverable error is seen.
+	var encodedSamlResponse string
+	for conn := range connections {
+		response, err := handleConnection(conn)
+		if err != nil {
+			break
+		}
+
+		encodedSamlResponse = getTokenFromResponse(response)
+		if encodedSamlResponse != "" {
+			httpResponse := buildResponse(application)
+			conn.Write(httpResponse.Bytes())
 			break
 		}
 	}
 
-	if tokenErr != nil {
-		return nil, nil, tokenErr
+	if err != nil {
+		return nil, nil, newAuthenticationError(err)
 	}
 
-	if acceptErr != nil {
-		return nil, nil, &SnowflakeError{
-			Number:      ErrFailedToGetExternalBrowserResponse,
-			SQLState:    SQLStateConnectionRejected,
-			Message:     errMsgFailedToGetExternalBrowserResponse,
-			MessageArgs: []interface{}{acceptErr},
-		}
+	// handle the case where the channel of connections was closed before a
+	// SAML response was received
+	if encodedSamlResponse == "" {
+		return nil, nil, newAuthenticationError("SAML response was not received")
 	}
 
 	escapedSamlResponse, err := url.QueryUnescape(encodedSamlResponse)
 	if err != nil {
 		glog.V(1).Infof("unable to unescape saml response. err: %v", err)
-		return nil, nil, err
+		return nil, nil, newAuthenticationError(err)
 	}
+
 	return []byte(escapedSamlResponse), []byte(proofKey), nil
+}
+
+// handleConnection reads bytes from the given connection and returns the data
+// as a string.
+func handleConnection(conn net.Conn) (string, error) {
+	var buf bytes.Buffer
+	var total int
+	for {
+		b := make([]byte, bufSize)
+		n, err := conn.Read(b)
+		if err != nil {
+			if err != io.EOF {
+				glog.V(1).Infof("error reading from socket. err: %v", err)
+				return "", err
+			}
+			return "", nil
+		}
+		total += n
+		buf.Write(b)
+		if n < bufSize {
+			// We successfully read all data
+			s := string(buf.Bytes()[:total])
+			return s, nil
+		}
+		buf.Grow(bufSize)
+	}
+}
+
+// newAuthenticationError returns a pointer to a SnowflakeError populated with
+// relevant error codes and then given error message.
+func newAuthenticationError(error interface{}) *SnowflakeError {
+	return &SnowflakeError{
+		Number:      ErrFailedToGetExternalBrowserResponse,
+		SQLState:    SQLStateConnectionRejected,
+		Message:     errMsgFailedToGetExternalBrowserResponse,
+		MessageArgs: []interface{}{error},
+	}
 }
